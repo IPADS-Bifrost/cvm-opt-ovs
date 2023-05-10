@@ -38,6 +38,9 @@
 #include <rte_pci.h>
 #include <rte_version.h>
 #include <rte_vhost.h>
+#ifdef CVM_OPT
+#include <rte_gro.h>
+#endif
 
 #include "cmap.h"
 #include "coverage.h"
@@ -1389,10 +1392,25 @@ out:
     return err;
 }
 
+#ifdef CVM_OPT
+#define GRO_DEFAULT_FLUSH_CYCLES 1
+#define GRO_MAX_FLUSH_CYCLES 4
+#define MAX_PKT_BURST 512
+#define MAX_VQ_NR (4)
+
+struct rte_gro_param gro_param;
+uint8_t gro_flush_cycles = GRO_DEFAULT_FLUSH_CYCLES;
+void *gro_ctx[MAX_VQ_NR];
+unsigned int gro_times;
+#endif
 static int
 netdev_dpdk_vhost_client_construct(struct netdev *netdev)
 {
     int err;
+#ifdef CVM_OPT
+    struct netdev_dpdk *dev;
+    int vid;
+#endif
 
     ovs_mutex_lock(&dpdk_mutex);
     err = vhost_common_construct(netdev);
@@ -1401,6 +1419,22 @@ netdev_dpdk_vhost_client_construct(struct netdev *netdev)
                  "port: %s\n", netdev->name);
     }
     ovs_mutex_unlock(&dpdk_mutex);
+#ifdef CVM_OPT
+    dev = netdev_dpdk_cast(netdev);
+    vid = netdev_dpdk_get_vid(dev);
+    VLOG_ERR("%s: vid %d", netdev_get_name(&dev->up), vid);
+
+    gro_param.gro_types = RTE_GRO_TCP_IPV4;
+    gro_param.max_flow_num = 1024/*GRO_MAX_FLUSH_CYCLES*/;
+    gro_param.max_item_per_flow = 1024/*MAX_PKT_BURST*/;
+    /* gro_param.socket_id = rte_lcore_to_socket_id(rte_get_main_lcore()); */
+    for (int i = 0; i < MAX_VQ_NR; i ++ ) {
+        gro_ctx[i] = rte_gro_ctx_create(&gro_param);
+        VLOG_ERR("%s:%d INIT i: %d gro_ctx: %p",
+                __func__, __LINE__, i, gro_ctx[i]);
+    }
+
+#endif
     return err;
 }
 
@@ -2730,6 +2764,158 @@ netdev_dpdk_common_send(struct netdev *netdev, struct dp_packet_batch *batch,
     return cnt;
 }
 
+#ifdef CVM_OPT
+struct pkt_info {
+    uint16_t ethertype;
+    uint16_t l2_len;
+    uint16_t l3_len;
+    uint16_t l4_len;
+    uint8_t l4_proto;
+    uint8_t tcp_flags;
+    uint32_t sent_seq;
+#if 0
+    uint8_t gso_enable;
+    uint8_t is_tunnel;
+    uint16_t outer_ethertype;
+    uint16_t outer_l2_len;
+    uint16_t outer_l3_len;
+    uint8_t outer_l4_proto;
+    uint16_t tso_segsz;
+    uint16_t tunnel_tso_segsz;
+    uint32_t pkt_len;
+#endif
+};
+
+/* Parse an IPv4 header to fill l3_len, l4_len, and l4_proto */
+static void
+parse_ipv4(struct rte_ipv4_hdr *ipv4_hdr, struct pkt_info *info)
+{
+    struct rte_tcp_hdr *tcp_hdr;
+
+    info->l3_len = rte_ipv4_hdr_len(ipv4_hdr);
+    info->l4_proto = ipv4_hdr->next_proto_id;
+
+    if (info->l4_proto == IPPROTO_TCP) {
+        tcp_hdr = (struct rte_tcp_hdr *)
+            ((char *)ipv4_hdr + info->l3_len);
+        info->l4_len = (tcp_hdr->data_off & 0xf0) >> 2;
+        info->sent_seq = rte_be_to_cpu_32(tcp_hdr->sent_seq);
+        info->tcp_flags = tcp_hdr->tcp_flags;
+    } else {
+        VLOG_ERR("%s: unsupported l4_proto %x",
+                __func__, info->l4_proto);
+        info->l4_len = 0;
+    }
+}
+
+/*
+ * Parse an ethernet header to fill the ethertype, l2_len, l3_len and
+ * ipproto. IPv4 & TCP only.
+ */
+static void
+parse_ethernet(struct rte_ether_hdr *eth_hdr, struct pkt_info *info)
+{
+    struct rte_ipv4_hdr *ipv4_hdr;
+
+    info->l2_len = sizeof(struct rte_ether_hdr);
+    info->ethertype = eth_hdr->ether_type;
+
+    switch (info->ethertype) {
+        case CONSTANT_HTONS(RTE_ETHER_TYPE_IPV4):
+            ipv4_hdr = (struct rte_ipv4_hdr *)
+                ((char *)eth_hdr + info->l2_len);
+            parse_ipv4(ipv4_hdr, info);
+            break;
+        default:
+            VLOG_ERR("%s: unsupported ethertype htons %x",
+                    __func__, htons(info->ethertype));
+            info->l4_len = 0;
+            info->l3_len = 0;
+            info->l4_proto = 0;
+            break;
+    }
+}
+
+static struct rte_tcp_hdr *parse_tcp(struct rte_mbuf *pkt) {
+    struct rte_ether_hdr *eth_hdr;
+    struct rte_ipv4_hdr *ipv4_hdr;
+    struct rte_tcp_hdr *tcp_hdr;
+
+    eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+    ipv4_hdr = (struct rte_ipv4_hdr *)((char *)eth_hdr + pkt->l2_len);
+    tcp_hdr = (struct rte_tcp_hdr *)((char *)ipv4_hdr + pkt->l3_len);
+    return tcp_hdr;
+}
+#endif
+
+#define ENABLE_HOST_GRO
+
+static struct rte_tcp_hdr *get_tcp_hdr(struct rte_mbuf *pkt)
+{
+    struct rte_ipv4_hdr *ipv4_hdr;
+    struct rte_ether_hdr *eth_hdr;
+    struct rte_tcp_hdr *tcp_hdr;
+    uint16_t l2_len, l3_len;
+
+    eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+
+    l2_len = sizeof(struct rte_ether_hdr);
+    ipv4_hdr = (struct rte_ipv4_hdr *)((char *)eth_hdr + l2_len);
+    l3_len = rte_ipv4_hdr_len(ipv4_hdr);
+    tcp_hdr = (struct rte_tcp_hdr *)((char *)ipv4_hdr + l3_len);
+    return tcp_hdr;
+}
+
+static void set_tcp_flags(struct rte_mbuf *pkt)
+{
+    struct rte_tcp_hdr *tcp_hdr = get_tcp_hdr(pkt);
+    tcp_hdr->tcp_flags &= ~(RTE_TCP_PSH_FLAG);
+}
+
+static void prepare_gro(struct rte_mbuf **pkts, int cnt, const char *symbol) {
+    struct pkt_info info;
+    for (int i = 0; i < cnt; i++) {
+        struct rte_mbuf *m;
+        struct rte_ether_hdr *eth_hdr;
+        if (likely(i < cnt - 1))
+            rte_prefetch0(rte_pktmbuf_mtod(pkts[i + 1], void *));
+
+        m = pkts[i];
+
+        /* Step 1: parse IPv4 header */
+        eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+        parse_ethernet(eth_hdr, &info);
+
+        /* Step 2: fill the mbuf metadata (flags and header lengths) */
+        m->l2_len = info.l2_len;
+        m->l3_len = info.l3_len;
+        m->l4_len = info.l4_len;
+
+        // VLOG_ERR(" [OVS] [%s] pkt: %d seq: %u len: %u PSH_FLAG: %s", 
+        //         symbol, i, info.sent_seq, pkts[i]->pkt_len,
+        //         info.tcp_flags & RTE_TCP_PSH_FLAG ? "true": "false");
+    }
+}
+
+static void dump_tcp_hdr(struct rte_mbuf *pkt, const char *symbol)
+{
+    struct rte_tcp_hdr *tcp_hdr = get_tcp_hdr(pkt);
+    VLOG_ERR(" [%s] seq: %u len: %u src_port: %u dst_port: %u ack: %u tcp_hdr_len: %u "
+             "tcp_flags: %u rx_win: %u cksum: %u tcp_urp: %u",
+             symbol,
+             rte_be_to_cpu_32(tcp_hdr->sent_seq), pkt->pkt_len - 14, 
+             rte_be_to_cpu_16(tcp_hdr->src_port),
+             rte_be_to_cpu_16(tcp_hdr->dst_port), rte_be_to_cpu_32(tcp_hdr->recv_ack),
+             (tcp_hdr->data_off & 0xf0) >> 2,
+             tcp_hdr->tcp_flags, rte_be_to_cpu_16(tcp_hdr->rx_win),
+             rte_cpu_to_be_16(tcp_hdr->cksum), rte_cpu_to_be_16(tcp_hdr->tcp_urp));
+}
+
+static int send_cnt = 0;
+struct rte_mbuf *cache_pkts[256][32];
+int pkts_cnt[256];
+uint64_t total_len = 0;
+bool test = false;
 static int
 netdev_dpdk_vhost_send(struct netdev *netdev, int qid,
                        struct dp_packet_batch *batch,
@@ -2760,8 +2946,41 @@ netdev_dpdk_vhost_send(struct netdev *netdev, int qid,
     }
 
     cnt = netdev_dpdk_common_send(netdev, batch, &stats);
-
     pkts = (struct rte_mbuf **) batch->packets;
+
+#if 0
+    for (int k = 0; k < cnt; k ++ ) {
+        /* increment ref count in case of memory free */
+        cache_pkts[send_cnt][k] = pkts[k];
+        rte_mbuf_refcnt_update(pkts[k], 1);
+        total_len += pkts[k]->pkt_len;
+        /* dump_tcp_hdr(pkts[k], "BEFORE GRO"); */
+    }
+    pkts_cnt[send_cnt] = cnt;
+    send_cnt ++ ;
+    if (total_len >= 142000 && !test) {
+        test = true;
+        VLOG_ERR("------ START TEST ------");
+        for (int _i = 0; _i < send_cnt; _i ++ ) {
+            prepare_gro(cache_pkts[_i], pkts_cnt[_i], "READ");
+            int flush_cnt = rte_gro_reassemble(cache_pkts[_i], pkts_cnt[_i], gro_ctx);
+            for (int j = 0; j < flush_cnt; j ++ ) {
+                /* VLOG_ERR(" [JUDGE] pkt_len: %u", cache_pkts[_i][j]->pkt_len); */
+                dump_tcp_hdr(cache_pkts[_i][j], "AFTER GRO");
+            }
+        }
+    }
+#else
+    prepare_gro(pkts, cnt, "READ");
+    cnt = rte_gro_reassemble(pkts, cnt, gro_ctx[qid]);
+    // for (int _i = 0; _i < cnt; _i ++ ) {
+    //     dump_tcp_hdr(pkts[_i], "AFTER GRO");
+    // }
+    // cnt = rte_gro_reassemble_burst(pkts, cnt, &gro_param);
+    // for (int _i = 0; _i < cnt; _i ++ ) {
+    //     dump_tcp_hdr(pkts[_i], "AFTER GRO");
+    // }
+#endif
     vhost_batch_cnt = cnt;
     retries = 0;
     do {

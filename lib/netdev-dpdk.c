@@ -1397,11 +1397,22 @@ out:
 #define GRO_MAX_FLUSH_CYCLES 4
 #define MAX_PKT_BURST 512
 #define MAX_VQ_NR (4)
+#define MAX_VM_NR (16)
 
 struct rte_gro_param gro_param;
 uint8_t gro_flush_cycles = GRO_DEFAULT_FLUSH_CYCLES;
-void *gro_ctx[MAX_VQ_NR];
+void *gro_ctx[MAX_VM_NR][MAX_VQ_NR];
+char netdev_list[MAX_VM_NR][48];
+unsigned int netdev_nr = 0;
 unsigned int gro_times;
+
+static int find_netdev(const char *name) {
+    for (int i = 0; i < netdev_nr; i ++ ) {
+        if (!strcmp(netdev_list[i], name))
+            return i;
+    }
+    assert(0);
+}
 #endif
 static int
 netdev_dpdk_vhost_client_construct(struct netdev *netdev)
@@ -1422,17 +1433,18 @@ netdev_dpdk_vhost_client_construct(struct netdev *netdev)
 #ifdef CVM_OPT
     dev = netdev_dpdk_cast(netdev);
     vid = netdev_dpdk_get_vid(dev);
-    VLOG_ERR("%s: vid %d", netdev_get_name(&dev->up), vid);
+    VLOG_ERR("%s:%s vid %d", netdev_get_name(&dev->up), netdev->name, vid);
+    // FIXME: data race on netdev_nr ? 
+    strcpy(netdev_list[netdev_nr], netdev->name);
 
     gro_param.gro_types = RTE_GRO_TCP_IPV4;
     gro_param.max_flow_num = 1024/*GRO_MAX_FLUSH_CYCLES*/;
     gro_param.max_item_per_flow = 1024/*MAX_PKT_BURST*/;
     /* gro_param.socket_id = rte_lcore_to_socket_id(rte_get_main_lcore()); */
     for (int i = 0; i < MAX_VQ_NR; i ++ ) {
-        gro_ctx[i] = rte_gro_ctx_create(&gro_param);
-        VLOG_ERR("%s:%d INIT i: %d gro_ctx: %p",
-                __func__, __LINE__, i, gro_ctx[i]);
+        gro_ctx[netdev_nr][i] = rte_gro_ctx_create(&gro_param);
     }
+    netdev_nr ++ ;
 
 #endif
     return err;
@@ -2972,7 +2984,8 @@ netdev_dpdk_vhost_send(struct netdev *netdev, int qid,
     }
 #else
     prepare_gro(pkts, cnt, "READ");
-    cnt = rte_gro_reassemble(pkts, cnt, gro_ctx[qid]);
+    int vmid = find_netdev(netdev->name);
+    cnt = rte_gro_reassemble(pkts, cnt, gro_ctx[vmid][qid]);
     // for (int _i = 0; _i < cnt; _i ++ ) {
     //     dump_tcp_hdr(pkts[_i], "AFTER GRO");
     // }
